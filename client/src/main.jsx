@@ -4,16 +4,29 @@ import { UploadCloud, ShieldCheck, Sparkles, Download, Image as ImageIcon, X, Za
 import './styles.css';
 
 const API = '/api/convert';
+const MAX_FILES = 20;
+const MAX_SIZE = 25 * 1024 * 1024;
 
 function formatBytes(bytes) {
   if (!bytes) return '0 B';
   const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), sizes.length - 1);
   return `${(bytes / Math.pow(1024, i)).toFixed(i ? 2 : 0)} ${sizes[i]}`;
 }
 
 function webpName(name) {
-  return name.replace(/\.(png|jpe?g)$/i, '.webp');
+  return name.replace(/\.(png|jpe?g)$/i, '') + '.webp';
+}
+
+function blobDownload(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1200);
 }
 
 function App() {
@@ -22,174 +35,248 @@ function App() {
   const [quality, setQuality] = useState(100);
   const [effort, setEffort] = useState(6);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState('');
   const [drag, setDrag] = useState(false);
+  const [message, setMessage] = useState('');
+  const [progress, setProgress] = useState(0);
   const inputRef = useRef(null);
 
-  const totalSize = useMemo(() => files.reduce((a, f) => a + f.size, 0), [files]);
+  const totalSize = useMemo(() => files.reduce((sum, item) => sum + item.file.size, 0), [files]);
+  const convertedCount = useMemo(() => files.filter(item => item.convertedBlob).length, [files]);
+  const canDownload = files.length > 0 && convertedCount === files.length && !busy;
+
+  function revokeItem(item) {
+    if (item.preview) URL.revokeObjectURL(item.preview);
+    if (item.convertedUrl) URL.revokeObjectURL(item.convertedUrl);
+  }
 
   function addFiles(list) {
     const incoming = Array.from(list || []);
-    const valid = incoming.filter(f => ['image/png', 'image/jpeg', 'image/jpg'].includes(f.type));
+    const valid = incoming.filter(file => ['image/png', 'image/jpeg', 'image/jpg'].includes(file.type) && file.size <= MAX_SIZE);
+
+    if (!valid.length) {
+      setMessage('Only PNG/JPG images up to 25MB are supported.');
+      return;
+    }
+
     const mapped = valid.map(file => ({
+      id: `${file.name}-${file.size}-${Date.now()}-${Math.random()}`,
       file,
-      id: `${file.name}-${file.size}-${crypto.randomUUID()}`,
-      preview: URL.createObjectURL(file)
+      preview: URL.createObjectURL(file),
+      status: 'Ready',
+      convertedBlob: null,
+      convertedUrl: null,
+      convertedSize: null
     }));
-    setFiles(prev => [...prev, ...mapped].slice(0, 20));
-    setMessage(valid.length ? '' : 'Only PNG and JPG images are supported.');
+
+    setFiles(prev => [...prev, ...mapped].slice(0, MAX_FILES));
+    setProgress(0);
+    setMessage('Images selected. Click Convert Images to start.');
   }
 
   function removeFile(id) {
     setFiles(prev => {
-      const item = prev.find(x => x.id === id);
-      if (item) URL.revokeObjectURL(item.preview);
-      return prev.filter(x => x.id !== id);
+      const found = prev.find(item => item.id === id);
+      if (found) revokeItem(found);
+      const next = prev.filter(item => item.id !== id);
+      if (!next.length) setProgress(0);
+      return next;
     });
   }
 
   function clearFiles() {
-    files.forEach(x => URL.revokeObjectURL(x.preview));
+    files.forEach(revokeItem);
     setFiles([]);
+    setProgress(0);
     setMessage('');
   }
 
-  async function requestConversion(items) {
+  async function convertOne(item) {
     const body = new FormData();
-    items.forEach(x => body.append('images', x.file));
+    body.append('images', item.file);
     body.append('mode', mode);
     body.append('quality', quality);
     body.append('effort', effort);
 
     const res = await fetch(API, { method: 'POST', body });
-    if (!res.ok) throw new Error((await res.json()).error || 'Conversion failed');
+    if (!res.ok) {
+      let error = 'Conversion failed.';
+      try { error = (await res.json()).error || error; } catch {}
+      throw new Error(error);
+    }
     return await res.blob();
   }
 
-  function saveBlob(blob, name) {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = name;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 600);
+  async function convertAll() {
+    if (!files.length || busy) return;
+    setBusy(true);
+    setProgress(0);
+    setMessage('Conversion started...');
+
+    setFiles(prev => prev.map(item => {
+      if (item.convertedUrl) URL.revokeObjectURL(item.convertedUrl);
+      return { ...item, status: 'Waiting', convertedBlob: null, convertedUrl: null, convertedSize: null };
+    }));
+
+    try {
+      for (let i = 0; i < files.length; i += 1) {
+        const current = files[i];
+        setFiles(prev => prev.map(item => item.id === current.id ? { ...item, status: 'Converting' } : item));
+
+        const blob = await convertOne(current);
+        const convertedUrl = URL.createObjectURL(blob);
+
+        setFiles(prev => prev.map(item => item.id === current.id ? {
+          ...item,
+          status: 'Done',
+          convertedBlob: blob,
+          convertedUrl,
+          convertedSize: blob.size
+        } : item));
+
+        const percent = Math.round(((i + 1) / files.length) * 100);
+        setProgress(percent);
+        setMessage(`Converted ${i + 1} of ${files.length} images.`);
+      }
+      setMessage('Conversion complete. Download single files or ZIP.');
+    } catch (error) {
+      setMessage(error.message || 'Conversion failed.');
+      setFiles(prev => prev.map(item => item.status === 'Converting' ? { ...item, status: 'Failed' } : item));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function downloadSingle(item) {
+    if (!item.convertedBlob) return;
+    blobDownload(item.convertedBlob, webpName(item.file.name));
   }
 
   async function downloadZip() {
-    if (!files.length) return;
+    if (!files.length || busy) return;
     setBusy(true);
-    setMessage('Creating high-quality WebP ZIP...');
+    setMessage('Preparing ZIP download...');
     try {
-      const blob = await requestConversion(files);
-      saveBlob(blob, files.length === 1 ? webpName(files[0].file.name) : 'webp-converted-images.zip');
-      setMessage('Done. ZIP download started.');
-    } catch (e) {
-      setMessage(e.message);
+      const body = new FormData();
+      files.forEach(item => body.append('images', item.file));
+      body.append('mode', mode);
+      body.append('quality', quality);
+      body.append('effort', effort);
+
+      const res = await fetch(API, { method: 'POST', body });
+      if (!res.ok) throw new Error((await res.json()).error || 'ZIP download failed.');
+      const blob = await res.blob();
+      blobDownload(blob, files.length === 1 ? webpName(files[0].file.name) : 'webp-converted-images.zip');
+      setMessage('ZIP download started.');
+    } catch (error) {
+      setMessage(error.message || 'ZIP download failed.');
     } finally {
       setBusy(false);
     }
   }
 
-  async function downloadSingle(item) {
-    setBusy(true);
-    setMessage(`Converting ${item.file.name}...`);
-    try {
-      const blob = await requestConversion([item]);
-      saveBlob(blob, webpName(item.file.name));
-      setMessage('Done. Single image download started.');
-    } catch (e) {
-      setMessage(e.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function downloadAllSingles() {
-    if (!files.length) return;
-    setBusy(true);
-    setMessage('Downloading each image separately...');
-    try {
-      for (const item of files) {
-        const blob = await requestConversion([item]);
-        saveBlob(blob, webpName(item.file.name));
-        await new Promise(resolve => setTimeout(resolve, 250));
-      }
-      setMessage('Done. Individual downloads started.');
-    } catch (e) {
-      setMessage(e.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return <main>
-    <section className="hero">
-      <nav className="nav">
-        <div className="brand"><div className="logo"><Sparkles size={18}/></div><span>WebP Converter Pro</span></div>
-        <div className="pill"><ShieldCheck size={15}/> Sharp powered conversion</div>
-      </nav>
-
-      <div className="heroGrid">
-        <div className="copy">
-          <div className="eyebrow"><Zap size={15}/> Premium PNG/JPG to WebP</div>
-          <h1>Convert images to clean, high-quality WebP.</h1>
-          <p>Upload PNG or JPG files, choose lossless or quality mode, then download one image, all images separately, or a single ZIP file.</p>
-          <div className="stats">
-            <div><b>20</b><span>files per batch</span></div>
-            <div><b>25MB</b><span>per image</span></div>
-            <div><b>ZIP</b><span>or single download</span></div>
-          </div>
+  return (
+    <main className="appShell">
+      <header className="topbar">
+        <div className="brand">
+          <div className="logo"><Sparkles size={18} /></div>
+          <div><strong>WebP Converter Pro</strong><span>High quality PNG/JPG to WebP</span></div>
         </div>
+        <div className="security"><ShieldCheck size={16} /> Server-side Sharp Engine</div>
+      </header>
 
-        <section className="panel">
-          <div className={`drop ${drag ? 'active' : ''}`} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);addFiles(e.dataTransfer.files)}} onClick={()=>inputRef.current.click()}>
-            <input ref={inputRef} type="file" accept="image/png,image/jpeg" multiple hidden onChange={e=>addFiles(e.target.files)} />
-            <div className="uploadIcon"><UploadCloud size={34}/></div>
-            <h2>Drop images here</h2>
-            <p>PNG and JPG supported</p>
-            <button className="secondary" type="button">Choose Images</button>
+      <section className="heroFull">
+        <div className="heroText">
+          <div className="eyebrow"><Zap size={15} /> Professional image converter</div>
+          <h1>Convert PNG & JPG images to premium WebP.</h1>
+          <p>Clean full-width interface, progress tracking, single-image downloads, and batch ZIP export.</p>
+        </div>
+        <div className="heroStats">
+          <div><b>{MAX_FILES}</b><span>files/batch</span></div>
+          <div><b>25MB</b><span>per image</span></div>
+          <div><b>{convertedCount}/{files.length}</b><span>converted</span></div>
+        </div>
+      </section>
+
+      <section className="workspace">
+        <aside className="leftPanel">
+          <div
+            className={`dropzone ${drag ? 'dragging' : ''}`}
+            onDragOver={e => { e.preventDefault(); setDrag(true); }}
+            onDragLeave={() => setDrag(false)}
+            onDrop={e => { e.preventDefault(); setDrag(false); addFiles(e.dataTransfer.files); }}
+          >
+            <input ref={inputRef} type="file" accept="image/png,image/jpeg" multiple hidden onChange={e => addFiles(e.target.files)} />
+            <div className="uploadBadge"><UploadCloud size={34} /></div>
+            <h2>Upload images</h2>
+            <p>Drag & drop PNG/JPG files here or browse from your computer.</p>
+            <button className="chooseBtn" type="button" onClick={() => inputRef.current?.click()}>Choose Images</button>
           </div>
 
-          <div className="settings">
-            <div className="settingsHead"><h3><SlidersHorizontal size={17}/> Settings</h3><span>{mode === 'lossless' ? 'Maximum quality' : `Quality ${quality}`}</span></div>
-            <div className="toggle">
-              <button className={mode==='lossless'?'on':''} onClick={()=>setMode('lossless')} type="button"><CheckCircle2 size={15}/> Lossless</button>
-              <button className={mode==='quality'?'on':''} onClick={()=>setMode('quality')} type="button">Quality WebP</button>
+          <div className="settingsCard">
+            <div className="cardTitle"><SlidersHorizontal size={18} /><strong>Conversion Settings</strong></div>
+            <div className="modeGrid">
+              <button className={mode === 'lossless' ? 'active' : ''} onClick={() => setMode('lossless')} type="button"><CheckCircle2 size={15} /> Lossless</button>
+              <button className={mode === 'quality' ? 'active' : ''} onClick={() => setMode('quality')} type="button">Quality WebP</button>
             </div>
-            <label className={mode==='lossless' ? 'disabledLabel' : ''}>Quality <b>{quality}</b><input type="range" min="1" max="100" value={quality} onChange={e=>setQuality(e.target.value)} disabled={mode==='lossless'} /></label>
-            <label>Compression effort <b>{effort}</b><input type="range" min="0" max="6" value={effort} onChange={e=>setEffort(e.target.value)} /></label>
+            <label className={mode === 'lossless' ? 'rangeRow muted' : 'rangeRow'}>
+              <span>Quality <b>{quality}</b></span>
+              <input type="range" min="1" max="100" value={quality} disabled={mode === 'lossless'} onChange={e => setQuality(e.target.value)} />
+            </label>
+            <label className="rangeRow">
+              <span>Compression effort <b>{effort}</b></span>
+              <input type="range" min="0" max="6" value={effort} onChange={e => setEffort(e.target.value)} />
+            </label>
+          </div>
+        </aside>
+
+        <section className="rightPanel">
+          <div className="toolbar">
+            <div>
+              <h2>Selected Images</h2>
+              <p>{files.length} files • {formatBytes(totalSize)}</p>
+            </div>
+            <button className="clearBtn" disabled={!files.length || busy} onClick={clearFiles}>Clear All</button>
           </div>
 
-          <div className="filebar"><span>{files.length} selected</span><span>{formatBytes(totalSize)}</span></div>
-          <div className="list">
-            {files.length === 0 && <div className="empty"><ImageIcon size={20}/> No files selected yet.</div>}
-            {files.map(x => <div className="file" key={x.id}>
-              <img src={x.preview} alt="preview"/>
-              <div className="fileMeta"><b title={x.file.name}>{x.file.name}</b><span>{formatBytes(x.file.size)}</span></div>
-              <button className="miniAction" onClick={()=>downloadSingle(x)} disabled={busy} title="Download this image"><Download size={15}/></button>
-              <button className="remove" onClick={()=>removeFile(x.id)} disabled={busy} title="Remove"><X size={15}/></button>
-            </div>)}
+          <div className="progressCard">
+            <div className="progressTop"><span>{busy ? 'Converting...' : convertedCount === files.length && files.length ? 'Ready to download' : 'Waiting for conversion'}</span><b>{progress}%</b></div>
+            <div className="progressTrack"><div style={{ width: `${progress}%` }} /></div>
+            {message && <p>{message}</p>}
           </div>
 
-          <div className="actions">
-            <button className="primary" disabled={!files.length || busy} onClick={downloadZip}><Archive size={17}/> {busy ? 'Working...' : 'Download ZIP'}</button>
-            <button className="ghost" disabled={!files.length || busy} onClick={downloadAllSingles}><Download size={17}/> Download Singles</button>
+          <div className="actionBar">
+            <button className="convertBtn" disabled={!files.length || busy} onClick={convertAll}><Zap size={18} /> {busy ? 'Converting...' : 'Convert Images'}</button>
+            <button className="zipBtn" disabled={!files.length || busy} onClick={downloadZip}><Archive size={18} /> Download ZIP</button>
           </div>
-          {files.length > 0 && <button className="clear" onClick={clearFiles} disabled={busy}>Clear all</button>}
-          {message && <p className="msg">{message}</p>}
+
+          <div className="fileTable">
+            {!files.length && (
+              <div className="emptyState"><ImageIcon size={28} /><h3>No images selected</h3><p>Upload images to start WebP conversion.</p></div>
+            )}
+            {files.map(item => (
+              <article className="fileRow" key={item.id}>
+                <img src={item.preview} alt="preview" />
+                <div className="fileInfo">
+                  <strong title={item.file.name}>{item.file.name}</strong>
+                  <span>{formatBytes(item.file.size)} {item.convertedSize ? `→ ${formatBytes(item.convertedSize)}` : ''}</span>
+                </div>
+                <span className={`status ${item.status.toLowerCase()}`}>{item.status}</span>
+                <button className="singleBtn" disabled={!item.convertedBlob || busy} onClick={() => downloadSingle(item)}><Download size={16} /> Download</button>
+                <button className="removeBtn" disabled={busy} onClick={() => removeFile(item.id)}><X size={16} /></button>
+              </article>
+            ))}
+          </div>
         </section>
-      </div>
-    </section>
+      </section>
 
-    <section className="features">
-      <div><Archive/><h3>ZIP Export</h3><p>Batch convert every selected image and download one clean ZIP file.</p></div>
-      <div><Download/><h3>Single Downloads</h3><p>Download any selected image directly as WebP without waiting for a ZIP.</p></div>
-      <div><ShieldCheck/><h3>Quality First</h3><p>Lossless mode preserves visual quality for premium output.</p></div>
-      <div><Rocket/><h3>Deploy Ready</h3><p>Works on GitHub and Render as one production Node service.</p></div>
-    </section>
-  </main>;
+      <section className="featureStrip">
+        <div><Archive size={20} /><b>ZIP Export</b><span>All files in one download</span></div>
+        <div><Download size={20} /><b>Single Download</b><span>Download any converted file</span></div>
+        <div><ShieldCheck size={20} /><b>Quality First</b><span>Lossless mode available</span></div>
+        <div><Rocket size={20} /><b>Render Ready</b><span>Deploy from GitHub</span></div>
+      </section>
+    </main>
+  );
 }
 
 createRoot(document.getElementById('root')).render(<App />);
