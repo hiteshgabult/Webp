@@ -52,6 +52,7 @@ app.post('/api/convert', upload.array('images', 20), async (req, res, next) => {
     if (converted.length === 1) {
       res.setHeader('Content-Type', 'image/webp');
       res.setHeader('Content-Disposition', `attachment; filename="${converted[0].filename}"`);
+      res.setHeader('X-Output-Filename', converted[0].filename);
       return res.end(converted[0].buffer);
     }
 
