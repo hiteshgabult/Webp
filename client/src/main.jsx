@@ -177,7 +177,7 @@ function App() {
       <section className="hero-card">
         <nav className="topbar">
           <div className="brand"><span className="brand-mark">W</span><span>WebP Converter Pro</span></div>
-          <div className="engine-badge">Server-side Sharp Engine</div>
+          <div className="engine-badge">Created By: Hitesh Gabu (Sr. Software Engineer)</div>
         </nav>
 
         <div className="hero-grid">
