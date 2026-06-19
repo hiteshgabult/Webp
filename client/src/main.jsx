@@ -93,7 +93,7 @@ function App() {
 
     try {
       const formData = new FormData();
-      formData.append("image", item.file);
+      formData.append("images", item.file);
       formData.append("mode", mode);
       formData.append("quality", String(quality));
       formData.append("effort", String(effort));
@@ -155,7 +155,7 @@ function App() {
     formData.append("quality", String(quality));
     formData.append("effort", String(effort));
 
-    const response = await fetch("/api/convert-zip", { method: "POST", body: formData });
+    const response = await fetch("/api/convert", { method: "POST", body: formData });
     if (!response.ok) {
       setMessage("ZIP download failed. Please try again.");
       return;
